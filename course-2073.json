@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-SanSyun",
+  "user": "SanSyun",
+  "totalScore": 500,
+  "chapters": {
+    "ch3": {
+      "points": "7/7",
+      "score": 100,
+      "commit": "78a6a69ab5d77f080474d114e693259d64674dc7"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "40090173766",
+    "runAttempt": "1"
+  }
+}
