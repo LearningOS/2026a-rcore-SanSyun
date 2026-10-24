@@ -1,4 +1,6 @@
 //! Types related to task management
+/// 最大支持系统调用数
+pub const MAX_SYSCALL_NUM: usize = 500;
 
 use super::TaskContext;
 
@@ -9,6 +11,8 @@ pub struct TaskControlBlock {
     pub task_status: TaskStatus,
     /// The task context
     pub task_cx: TaskContext,
+    /// 该任务对每个系统调用的调用次数统计
+    pub syscall_times: [u32; MAX_SYSCALL_NUM],
 }
 
 /// The status of a task
