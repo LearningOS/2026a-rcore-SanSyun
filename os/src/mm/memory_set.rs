@@ -78,6 +78,68 @@ impl MemorySet {
             PTEFlags::R | PTEFlags::X,
         );
     }
+
+    /// 判断 [start_va, end_va) 是否和已有映射区重叠
+    pub fn is_overlap(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start = start_va.floor();
+        let end = end_va.ceil();
+        self.areas
+            .iter()
+            .any(|area| start < area.vpn_range.get_end() && area.vpn_range.get_start() < end)
+    }
+
+    /// 解除 [start_va, end_va) 的映射，成功返回 true。
+    /// 支持整块删除、从头部/尾部收缩，以及在区域中间挖洞。
+    pub fn unmap(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let start = start_va.floor();
+        let end = end_va.ceil();
+        if start >= end {
+            return false;
+        }
+        // 必须完整落在某一个区域内部，否则失败
+        let Some(idx) = self
+            .areas
+            .iter()
+            .position(|area| area.vpn_range.get_start() <= start && end <= area.vpn_range.get_end())
+        else {
+            return false;
+        };
+
+        let area_start = self.areas[idx].vpn_range.get_start();
+        let area_end = self.areas[idx].vpn_range.get_end();
+
+        if start == area_start && end == area_end {
+            // 整块删除
+            let mut area = self.areas.remove(idx);
+            area.unmap(&mut self.page_table);
+            return true;
+        }
+        if start == area_start {
+            // 从头部收缩
+            self.areas[idx].shrink_front(&mut self.page_table, end);
+            return true;
+        }
+        if end == area_end {
+            // 从尾部收缩（复用现成的 shrink_to）
+            self.areas[idx].shrink_to(&mut self.page_table, start);
+            return true;
+        }
+        // 中间挖洞：拆成 [area_start, start) 和 [end, area_end) 两段
+        let area = &mut self.areas[idx];
+        let mut tail = MapArea::new(end.into(), area_end.into(), area.map_type, area.map_perm);
+        for vpn in VPNRange::new(end, area_end) {
+            if let Some(frame) = area.data_frames.remove(&vpn) {
+                tail.data_frames.insert(vpn, frame); // 转移物理页所有权，不能重新分配
+            }
+        }
+        for vpn in VPNRange::new(start, end) {
+            area.unmap_one(&mut self.page_table, vpn);
+        }
+        area.vpn_range = VPNRange::new(area_start, start);
+        self.areas.push(tail);
+        true
+    }
+
     /// Without kernel stacks.
     pub fn new_kernel() -> Self {
         let mut memory_set = Self::new_bare();
@@ -327,6 +389,14 @@ impl MapArea {
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
+
+    pub fn shrink_front(&mut self, page_table: &mut PageTable, new_start: VirtPageNum) {
+        for vpn in VPNRange::new(self.vpn_range.get_start(), new_start) {
+            self.unmap_one(page_table, vpn);
+        }
+        self.vpn_range = VPNRange::new(new_start, self.vpn_range.get_end());
+    }
+
     #[allow(unused)]
     pub fn append_to(&mut self, page_table: &mut PageTable, new_end: VirtPageNum) {
         for vpn in VPNRange::new(self.vpn_range.get_end(), new_end) {

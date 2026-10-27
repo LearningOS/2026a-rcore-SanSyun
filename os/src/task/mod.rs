@@ -14,6 +14,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::mm::{MapPermission, VirtAddr};
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
@@ -21,6 +22,7 @@ use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
+use crate::config::{MAX_SYSCALL_NUM};
 
 pub use context::TaskContext;
 
@@ -45,7 +47,7 @@ struct TaskManagerInner {
     /// task list
     tasks: Vec<TaskControlBlock>,
     /// id of current `Running` task
-    current_task: usize,
+    current_task: usize,    
 }
 
 lazy_static! {
@@ -133,6 +135,27 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    fn mmap_current(&self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let memory_set = &mut inner.tasks[cur].memory_set;
+        if memory_set.is_overlap(start, end) {
+            return -1;                       // 重叠就什么都不做
+        }
+        memory_set.insert_framed_area(start, end, perm);
+        0
+    }
+
+    fn munmap_current(&self, start: VirtAddr, end: VirtAddr) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        if inner.tasks[cur].memory_set.unmap(start, end) {
+            0
+        } else {
+            -1
+        }
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -151,6 +174,26 @@ impl TaskManager {
             // go back to user mode
         } else {
             panic!("All applications completed!");
+        }
+    }
+
+    /// 记录当前任务发生了一次编号为 `syscall_id` 的系统调用
+    fn inc_syscall_times(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if syscall_id < MAX_SYSCALL_NUM {
+            inner.tasks[current].syscall_times[syscall_id] += 1;
+        }
+    }
+
+    /// 查询当前任务调用 `syscall_id` 的次数
+    fn get_syscall_times(&self, syscall_id: usize) -> isize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        if syscall_id < MAX_SYSCALL_NUM {
+            inner.tasks[current].syscall_times[syscall_id] as isize
+        } else {
+            0
         }
     }
 }
@@ -201,4 +244,25 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// 调用次数增加
+pub fn inc_syscall_times(syscall_id: usize){
+    TASK_MANAGER.inc_syscall_times(syscall_id);
+}
+
+/// 查询调用次数
+pub fn get_syscall_times(syscall_id: usize) -> isize{
+    let ret = TASK_MANAGER.get_syscall_times(syscall_id);
+    ret
+}
+
+/// 在当前任务地址空间中建立 [start, end) 的映射
+pub fn mmap_current(start: VirtAddr, end: VirtAddr, perm: MapPermission) -> isize {
+    TASK_MANAGER.mmap_current(start, end, perm)
+}
+
+/// 解除当前任务 [start, end) 的映射
+pub fn munmap_current(start: VirtAddr, end: VirtAddr) -> isize {
+    TASK_MANAGER.munmap_current(start, end)
 }
