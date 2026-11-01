@@ -1,7 +1,7 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{BIG_STRIDE, DEFAULT_PRIORITY, TRAP_CONTEXT_BASE};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
@@ -68,6 +68,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// 进程已累计的 stride，供 stride 调度算法使用
+    pub stride: usize,
+
+    /// 进程的调度优先级
+    pub priority: usize,
 }
 
 impl TaskControlBlockInner {
@@ -84,6 +90,14 @@ impl TaskControlBlockInner {
     }
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
+    }
+
+    /// 进程每次被调度时 stride 的增量
+    ///
+    /// `pass = BIG_STRIDE / priority`，所以优先级大一倍的进程每轮只前进一半的
+    /// stride，因而能拿到两倍的 CPU 时间。
+    pub fn pass(&self) -> usize {
+        (BIG_STRIDE / self.priority).max(1)
     }
 }
 
@@ -118,6 +132,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    stride: 0,
+                    priority: DEFAULT_PRIORITY,
                 })
             },
         };
@@ -131,6 +147,63 @@ impl TaskControlBlock {
             trap_handler as usize,
         );
         task_control_block
+    }
+
+    /// 从内核中已有的 elf 镜像创建一个新进程
+    ///
+    /// 与 `fork` 不同，新进程得到的是全新的地址空间，不会复制父进程的任何内容，
+    /// 这就是 `spawn` 的语义。
+    pub fn spawn(self: &Arc<Self>, elf_data: &[u8]) -> Arc<Self> {
+        // 包含 elf 各段、trampoline、trap 上下文与用户栈的地址空间
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let trap_cx_ppn = memory_set
+            .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
+            .unwrap()
+            .ppn();
+        // 在内核空间分配 pid 与内核栈
+        let pid_handle = pid_alloc();
+        let kernel_stack = kstack_alloc();
+        let kernel_stack_top = kernel_stack.get_top();
+        // ---- 独占访问父进程的 PCB
+        let mut parent_inner = self.inner_exclusive_access();
+        let task_control_block = Arc::new(TaskControlBlock {
+            pid: pid_handle,
+            kernel_stack,
+            inner: unsafe {
+                UPSafeCell::new(TaskControlBlockInner {
+                    trap_cx_ppn,
+                    base_size: user_sp,
+                    task_cx: TaskContext::goto_trap_return(kernel_stack_top),
+                    task_status: TaskStatus::Ready,
+                    memory_set,
+                    parent: Some(Arc::downgrade(self)),
+                    children: Vec::new(),
+                    exit_code: 0,
+                    heap_bottom: user_sp,
+                    program_brk: user_sp,
+                    // 继承父进程的调度状态，否则新进程从 stride 0 开始会独占
+                    // CPU，直到追平其它所有进程
+                    stride: parent_inner.stride,
+                    priority: parent_inner.priority,
+                })
+            },
+        });
+        // 在用户空间准备好 TrapContext：新进程从自己 elf 的入口开始，
+        // 使用干净的用户栈
+        {
+            let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
+            *trap_cx = TrapContext::app_init_context(
+                entry_point,
+                user_sp,
+                KERNEL_SPACE.exclusive_access().token(),
+                kernel_stack_top,
+                trap_handler as usize,
+            );
+        }
+        // 加入父进程的子进程列表
+        parent_inner.children.push(task_control_block.clone());
+        task_control_block
+        // ---- 父进程 PCB 在此自动释放
     }
 
     /// Load a new elf to replace the original application address space and start execution
@@ -191,6 +264,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    stride: parent_inner.stride,
+                    priority: parent_inner.priority,
                 })
             },
         });
