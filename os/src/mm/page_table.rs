@@ -8,13 +8,21 @@ use bitflags::*;
 bitflags! {
     /// page table entry flags
     pub struct PTEFlags: u8 {
+        /// 有效位
         const V = 1 << 0;
+        /// 可读
         const R = 1 << 1;
+        /// 可写
         const W = 1 << 2;
+        /// 可执行
         const X = 1 << 3;
+        /// 用户态可访问
         const U = 1 << 4;
+        /// 全局映射
         const G = 1 << 5;
+        /// 已访问
         const A = 1 << 6;
+        /// 脏页
         const D = 1 << 7;
     }
 }
