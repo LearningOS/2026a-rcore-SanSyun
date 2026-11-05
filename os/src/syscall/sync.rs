@@ -1,3 +1,4 @@
+use crate::sync::deadlock::{self, ResKind, DEADLOCK_RET};
 use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
@@ -69,11 +70,24 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
             .tid
     );
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
-    let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
-    drop(process_inner);
-    drop(process);
+    let (mutex, detect) = {
+        let process_inner = process.inner_exclusive_access();
+        (
+            Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap()),
+            process_inner.deadlock_detect,
+        )
+    };
+    if detect && mutex.is_locked() {
+        // Locking would block the current thread: check the resulting state
+        // before actually blocking.
+        deadlock::set_waiting(ResKind::Mutex, mutex.id());
+        if deadlock::check_deadlock(&process, ResKind::Mutex, mutex.id()) {
+            deadlock::clear_waiting();
+            return DEADLOCK_RET;
+        }
+    }
     mutex.lock();
+    deadlock::clear_waiting();
     0
 }
 /// mutex unlock syscall
@@ -163,10 +177,24 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
             .tid
     );
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
-    let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
-    drop(process_inner);
+    let (sem, detect) = {
+        let process_inner = process.inner_exclusive_access();
+        (
+            Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap()),
+            process_inner.deadlock_detect,
+        )
+    };
+    if detect && sem.available() == 0 {
+        // Downing would block the current thread: check the resulting state
+        // before actually blocking.
+        deadlock::set_waiting(ResKind::Sem, sem.id());
+        if deadlock::check_deadlock(&process, ResKind::Sem, sem.id()) {
+            deadlock::clear_waiting();
+            return DEADLOCK_RET;
+        }
+    }
     sem.down();
+    deadlock::clear_waiting();
     0
 }
 /// condvar create syscall
@@ -244,8 +272,30 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
 }
 /// enable deadlock detection syscall
 ///
-/// YOUR JOB: Implement deadlock detection, but might not all in this syscall
-pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
-    trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
-    -1
+/// Enable (1) or disable (0) deadlock detection for the current process.
+/// Returns 0 on success and -1 on failure.
+pub fn sys_enable_deadlock_detect(is_enable: usize) -> isize {
+    trace!(
+        "kernel:pid[{}] tid[{}] sys_enable_deadlock_detect",
+        current_task().unwrap().process.upgrade().unwrap().getpid(),
+        current_task()
+            .unwrap()
+            .inner_exclusive_access()
+            .res
+            .as_ref()
+            .unwrap()
+            .tid
+    );
+    if is_enable > 1 {
+        // invalid parameter
+        return -1;
+    }
+    let process = current_process();
+    let mut process_inner = process.inner_exclusive_access();
+    process_inner.deadlock_detect = is_enable == 1;
+    // a disabled detector should not keep stale bookkeeping around
+    if is_enable == 0 {
+        process_inner.res_wait.clear();
+    }
+    0
 }

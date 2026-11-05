@@ -112,6 +112,10 @@ pub fn sys_waittid(tid: usize) -> i32 {
     if let Some(exit_code) = exit_code {
         // dealloc the exited thread
         process_inner.tasks[tid] = None;
+        // drop the deadlock-detection bookkeeping of the reaped thread, its
+        // tid may be recycled by a later thread
+        process_inner.res_hold.retain(|(t, _, _, _)| *t != tid);
+        process_inner.res_wait.retain(|(t, _, _)| *t != tid);
         exit_code
     } else {
         // waited thread has not exited
